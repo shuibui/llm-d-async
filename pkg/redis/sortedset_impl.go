@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -68,6 +69,7 @@ type RedisSortedSetFlow struct {
 	resultChannel   chan api.ResultMessage
 	pollInterval    time.Duration
 	batchSize       int
+	activeReleases  sync.Map
 	gate            pipeline.DispatchGate
 	gateFactory     pipeline.GateFactory
 }
@@ -254,8 +256,34 @@ func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel cha
 			ir.RequestQueueName = queueName
 		}
 
+		// Per-attribute gating
+		var release func()
+		if attrGate, ok := gate.(pipeline.AttributeGate); ok {
+			allowed, rel, err := attrGate.Acquire(ctx, rview.ReqMetadata())
+			if err != nil {
+				logger.V(logutil.DEFAULT).Error(err, "Failed to acquire attribute quota")
+				// Re-enqueue the message if acquisition fails
+				member, _ := json.Marshal(ir)
+				r.rdb.ZAdd(ctx, queueName, redis.Z{Score: deadline, Member: string(member)})
+				continue
+			}
+			if !allowed {
+				// Re-enqueue the message (wait for quota)
+				member, _ := json.Marshal(ir)
+				r.rdb.ZAdd(ctx, queueName, redis.Z{Score: deadline, Member: string(member)})
+				continue
+			}
+			release = rel
+		} else {
+			release = func() {}
+		}
+
 		select {
+
 		case msgChannel <- ir:
+			if release != nil {
+				r.activeReleases.Store(rview.ReqID(), release)
+			}
 		case <-ctx.Done():
 			if err := retryRedisOp(context.Background(), func(ctx context.Context) error {
 				return r.rdb.ZAdd(ctx, queueName, redis.Z{
@@ -264,6 +292,9 @@ func (r *RedisSortedSetFlow) processMessages(ctx context.Context, msgChannel cha
 				}).Err()
 			}); err != nil {
 				logger.V(logutil.DEFAULT).Error(err, "Failed to re-queue message on shutdown", "id", rview.ReqID())
+			}
+			if release != nil {
+				release()
 			}
 			return
 		}
@@ -365,6 +396,12 @@ func (r *RedisSortedSetFlow) flushRetryBatch(ctx context.Context, batch []pipeli
 func (r *RedisSortedSetFlow) resultWorker(ctx context.Context) {
 	processMsg := func(flushCtx context.Context, msg api.ResultMessage) {
 		batch := drainBatch(msg, r.resultChannel, maxBatchSize)
+		// Release quota for all messages in the batch
+		for _, m := range batch {
+			if rel, ok := r.activeReleases.LoadAndDelete(m.ID); ok {
+				rel.(func())()
+			}
+		}
 		r.flushResultBatch(flushCtx, batch)
 	}
 

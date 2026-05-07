@@ -17,6 +17,7 @@ limitations under the License.
 package flowcontrol
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"time"
@@ -63,6 +64,7 @@ func NewGateFactoryWithCacheTTL(prometheusURL string, cacheTTL time.Duration) *G
 //   - "redis": Queries Redis for dispatch budget
 //   - "prometheus-saturation": Queries Prometheus for pool saturation metric.
 //     Params: pool (required), threshold (default 0.8), fallback (default 0.0)
+//   - "composite": Combines multiple gates. Params: gates (JSON array of gate configurations)
 //   - "prometheus-budget": Cascades two Prometheus metric sources to compute dispatch budget D.
 //     Both sources compute max_SYS = ready_pods × max_concurrency dynamically.
 //     Primary: D = 1 − (queue_size / max_SYS) via inference_extension_flow_control_queue_size.
@@ -78,6 +80,33 @@ func NewGateFactoryWithCacheTTL(prometheusURL string, cacheTTL time.Duration) *G
 // For unsupported or unknown gate types, returns ConstOpenGate as a safe default.
 func (f *GateFactory) CreateGate(gateType string, params map[string]string) (pipeline.DispatchGate, error) {
 	switch gateType {
+	case "composite":
+		gatesJSON := params["gates"]
+		if gatesJSON == "" {
+			return nil, fmt.Errorf("composite gate requires 'gates' parameter with JSON array of gate configurations")
+		}
+
+		type gateConfig struct {
+			GateType   string            `json:"gate_type"`
+			GateParams map[string]string `json:"gate_params"`
+		}
+
+		var configs []gateConfig
+		if err := json.Unmarshal([]byte(gatesJSON), &configs); err != nil {
+			return nil, fmt.Errorf("composite gate failed to parse 'gates' parameter: %w", err)
+		}
+
+		var innerGates []pipeline.DispatchGate
+		for _, cfg := range configs {
+			gate, err := f.CreateGate(cfg.GateType, cfg.GateParams)
+			if err != nil {
+				return nil, fmt.Errorf("composite gate failed to create inner gate %q: %w", cfg.GateType, err)
+			}
+			innerGates = append(innerGates, gate)
+		}
+
+		return NewCompositeGate(innerGates...), nil
+
 	case "constant":
 		return ConstOpenGate(), nil
 
@@ -96,6 +125,48 @@ func (f *GateFactory) CreateGate(gateType string, params map[string]string) (pip
 			budgetKey = "dispatch-gate-budget"
 		}
 		return redisgate.NewRedisDispatchGate(client, budgetKey), nil
+
+	case "redis-quota":
+		addr := params["address"]
+		if addr == "" {
+			return nil, fmt.Errorf("redis-quota gate requires an 'address' in gate_params")
+		}
+		client, ok := f.redisClients[addr]
+		if !ok {
+			client = goredis.NewClient(&goredis.Options{Addr: addr})
+			f.redisClients[addr] = client
+		}
+
+		attr := params["attribute"]
+		if attr == "" {
+			attr = "userid"
+		}
+
+		mode := redisgate.QuotaMode(params["mode"])
+		if mode == "" {
+			mode = redisgate.QuotaModeRateLimit
+		}
+
+		limit, err := strconv.Atoi(params["limit"])
+		if err != nil {
+			return nil, fmt.Errorf("redis-quota gate requires a valid 'limit': %w", err)
+		}
+
+		windowStr := params["window"]
+		if windowStr == "" {
+			windowStr = "1m"
+		}
+		window, err := time.ParseDuration(windowStr)
+		if err != nil {
+			return nil, fmt.Errorf("redis-quota gate requires a valid 'window' duration: %w", err)
+		}
+
+		prefix := params["prefix"]
+		if prefix == "" {
+			prefix = "quota:"
+		}
+
+		return redisgate.NewRedisQuotaGate(client, attr, mode, limit, window, prefix), nil
 
 	case "prometheus-saturation":
 		if f.prometheusURL == "" {

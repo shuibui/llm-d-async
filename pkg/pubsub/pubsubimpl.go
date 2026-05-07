@@ -34,6 +34,8 @@ var (
 	resultChannels sync.Map
 )
 
+const quotaExceededNackDelay = 10 * time.Second
+
 type TopicConfig struct {
 	SubscriberID       string            `json:"subscriber_id"`
 	InferenceObjective string            `json:"inference_objective"`
@@ -278,38 +280,9 @@ func (r *PubSubMQFlow) requestWorker(ctx context.Context, pubSubClient *pubsub.C
 			cancel()
 			continue
 		}
-		err := sub.Receive(receiveCtx, func(ctx context.Context, msg *pubsub.Message) {
 
-			deliveryAttempt := msg.DeliveryAttempt
+		err := r.processMessages(receiveCtx, sub.Receive, ch, gate)
 
-			var body api.RequestMessage
-			err := json.Unmarshal(msg.Data, &body)
-			if err != nil {
-				logger.V(logutil.DEFAULT).Error(err, "Failed to unmarshal message from request queue")
-				msg.Ack()
-				return
-			}
-
-			irout := api.InternalRouting{TransportCorrelationID: msg.ID}
-			if deliveryAttempt != nil {
-				irout.RetryCount = *deliveryAttempt - 1
-			}
-			ir := api.NewInternalRequest(irout, &body)
-
-			resultsChannel := make(chan bool, 1)
-			resultChannels.Store(msg.ID, resultsChannel)
-			defer resultChannels.Delete(msg.ID)
-
-			ch <- ir
-
-			result := <-resultsChannel
-			if !result {
-				msg.Nack()
-			} else {
-				metrics.MessageLatencyTime.Observe(float64(time.Since(msg.PublishTime).Milliseconds()))
-				msg.Ack()
-			}
-		})
 		cancel()
 		// TODO
 		if err != nil {
@@ -317,4 +290,67 @@ func (r *PubSubMQFlow) requestWorker(ctx context.Context, pubSubClient *pubsub.C
 		}
 	}
 
+}
+
+type receiveFunc func(context.Context, func(context.Context, *pubsub.Message)) error
+
+func (r *PubSubMQFlow) processMessages(ctx context.Context, receive receiveFunc, ch chan *api.InternalRequest, gate pipeline.DispatchGate) error {
+	logger := log.FromContext(ctx)
+	return receive(ctx, func(ctx context.Context, msg *pubsub.Message) {
+
+		var body api.RequestMessage
+		err := json.Unmarshal(msg.Data, &body)
+		if err != nil {
+			logger.V(logutil.DEFAULT).Error(err, "Failed to unmarshal message from request queue")
+			msg.Ack()
+			return
+		}
+
+		irout := api.InternalRouting{TransportCorrelationID: msg.ID}
+		if msg.DeliveryAttempt != nil {
+			irout.RetryCount = *msg.DeliveryAttempt - 1
+		}
+		ir := api.NewInternalRequest(irout, &body)
+
+		// Per-attribute gating
+		var release func()
+		if attrGate, ok := gate.(pipeline.AttributeGate); ok {
+			allowed, rel, err := attrGate.Acquire(ctx, msg.Attributes)
+			if err != nil {
+				logger.V(logutil.DEFAULT).Error(err, "Failed to acquire attribute quota")
+				msg.Nack()
+				return
+			}
+			if !allowed {
+				logger.V(logutil.DEBUG).Info("Quota exceeded, delaying Nack", "msgID", msg.ID, "delay", quotaExceededNackDelay)
+				go func() {
+					select {
+					case <-time.After(quotaExceededNackDelay):
+						msg.Nack()
+					case <-ctx.Done():
+						msg.Nack()
+					}
+				}()
+				return
+			}
+			release = rel
+		} else {
+			release = func() {}
+		}
+		defer release()
+
+		resultsChannel := make(chan bool, 1)
+		resultChannels.Store(msg.ID, resultsChannel)
+		defer resultChannels.Delete(msg.ID)
+
+		ch <- ir
+
+		result := <-resultsChannel
+		if !result {
+			msg.Nack()
+		} else {
+			metrics.MessageLatencyTime.Observe(float64(time.Since(msg.PublishTime).Milliseconds()))
+			msg.Ack()
+		}
+	})
 }

@@ -85,6 +85,7 @@ make deploy-ap-on-k8s
 
  - `prometheus-url`: Prometheus server URL for metric-based gates (e.g., http://localhost:9090). For Google Managed Prometheus (GMP), point this to a local proxy or GMP frontend that handles authentication — direct GMP URLs are not supported as the Async Processor does not perform GMP authentication.
    This flag is required when using metric-based per-queue gates (e.g., `prometheus-saturation`, `prometheus-budget`).
+ - `prometheus-cache-ttl`: TTL for cached Prometheus metric sources (e.g. 1m, 0s to disable). Default is 5s. Increasing this reduces Prometheus load but also reduces the responsiveness of dispatch gates to metric changes.
 
 <i>additional parameters may be specified for concrete message queue implementations</i>
 
@@ -100,6 +101,7 @@ For more fine-grained control, configure gates per queue in your configuration f
 
 - `constant`: Always returns budget 1.0 (fully open) - no throttling.
 - `redis`: Queries Redis for dispatch budget (managed by external system).
+- `composite`: Combines multiple gates. Returns the minimum budget across all inner dispatch gates and acquires quota across all inner attribute gates (all or nothing).
 - `prometheus-saturation`: Queries Prometheus for pool saturation metric. The gate closes (returns `0.0`) when saturation ≥ threshold; when open it returns `(1 - saturation) - (1 - threshold)`, i.e. the margin below the threshold.
 - `prometheus-budget`: Computes a dispatch budget D using a cascade of two Prometheus metric sources. Both sources compute `max_SYS = ready_pods × max_concurrency` dynamically. The primary source uses the EPP flow control queue size: `D = 1 − (queue_size / max_SYS)`. If the primary is unavailable, it falls back to a secondary source using vLLM and pool metrics: `D = 1 − (running_requests / max_SYS)`. The gate closes when D ≤ B (baseline); callers compute `N = max_SYS × (D − B)`. See [docs/dispatch-budget.md](docs/dispatch-budget.md) for details.
 
@@ -143,11 +145,23 @@ For more fine-grained control, configure gates per queue in your configuration f
           "address": "localhost:6379",
           "budget_key": "my-budget-key"
        }
+    },
+    {
+       "queue_name": "composite_gated_queue",
+       "inference_objective": "composite-task",
+       "request_path_url": "/v1/inference",
+       "gate_type": "composite",
+       "gate_params": {
+          "gates": "[{\"gate_type\":\"prometheus-saturation\",\"gate_params\":{\"pool\":\"inference_pool_1\"}},{\"gate_type\":\"redis-quota\",\"gate_params\":{\"address\":\"localhost:6379\",\"limit\":\"100\"}}]"
+       }
     }
 ]
 ```
 
 **Gate Parameters:**
+
+- `composite`:
+  - `gates` (**required**): A JSON array of gate configurations. Each configuration is an object with `gate_type` and `gate_params`.
 
 - `redis`:
   - `address` (**required**): Redis server address for the dispatch gate (e.g., `localhost:6379`). Queues sharing the same address will share the same connection pool.

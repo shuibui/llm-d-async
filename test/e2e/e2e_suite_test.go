@@ -43,6 +43,10 @@ const (
 	asyncProcessorSaturationManifest = "./yaml/async-processor-saturation.yaml"
 	// asyncProcessorBudgetManifest is the manifest for the budget-gated async-processor.
 	asyncProcessorBudgetManifest = "./yaml/async-processor-budget.yaml"
+	// asyncProcessorQuotaManifest is the manifest for the quota-gated async-processor.
+	asyncProcessorQuotaManifest = "./yaml/async-processor-quota.yaml"
+	// asyncProcessorCompositeManifest is the manifest for the composite-gated async-processor.
+	asyncProcessorCompositeManifest = "./yaml/async-processor-composite.yaml"
 )
 
 var (
@@ -65,6 +69,8 @@ var (
 	asyncProcessorObjects           []string
 	asyncProcessorSaturationObjects []string
 	asyncProcessorBudgetObjects     []string
+	asyncProcessorQuotaObjects      []string
+	asyncProcessorCompositeObjects  []string
 	createdNameSpace                bool
 
 	rdb         *redis.Client
@@ -228,13 +234,26 @@ func applyManifests() {
 		"${AP_IMAGE}": apImage,
 	})
 	asyncProcessorSaturationObjects = testutils.CreateObjsFromYaml(testConfig, apSatYamls)
-
 	ginkgo.By("Applying async-processor-budget manifest")
 	apBudgetYamls := testutils.ReadYaml(asyncProcessorBudgetManifest)
 	apBudgetYamls = substituteMany(apBudgetYamls, map[string]string{
 		"${AP_IMAGE}": apImage,
 	})
 	asyncProcessorBudgetObjects = testutils.CreateObjsFromYaml(testConfig, apBudgetYamls)
+
+	ginkgo.By("Applying async-processor-quota manifest")
+	apQuotaYamls := testutils.ReadYaml(asyncProcessorQuotaManifest)
+	apQuotaYamls = substituteMany(apQuotaYamls, map[string]string{
+		"${AP_IMAGE}": apImage,
+	})
+	asyncProcessorQuotaObjects = testutils.CreateObjsFromYaml(testConfig, apQuotaYamls)
+
+	ginkgo.By("Applying async-processor-composite manifest")
+	apCompositeYamls := testutils.ReadYaml(asyncProcessorCompositeManifest)
+	apCompositeYamls = substituteMany(apCompositeYamls, map[string]string{
+		"${AP_IMAGE}": apImage,
+	})
+	asyncProcessorCompositeObjects = testutils.CreateObjsFromYaml(testConfig, apCompositeYamls)
 }
 
 func setupRedisClient() {
